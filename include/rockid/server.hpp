@@ -35,6 +35,8 @@ class Server : public Hub {
   void push_many(const std::vector<int64_t> &user_ids, const Json &message,
                  Connection *except) override;
   bool online(int64_t user_id) const override;
+  void close_token(int64_t user_id, const std::string &token) override;
+  void close_hash(int64_t user_id, const std::string &token_hash) override;
 
  private:
   void accept_all();

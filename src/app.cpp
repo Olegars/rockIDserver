@@ -3,6 +3,7 @@
 #include "rockid/connection.hpp"
 #include "rockid/log.hpp"
 
+#include <ctime>
 #include <set>
 #include <string>
 
@@ -11,7 +12,7 @@ namespace {
 
 bool public_method(const std::string &method) {
   return method == "ping" || method == "auth.signUp" || method == "auth.signIn" ||
-         method == "auth.bind";
+         method == "auth.bind" || method == "auth.checkCloudPassword" || method == "auth.botSignIn";
 }
 
 void check_username(const std::string &username) {
@@ -29,7 +30,9 @@ void check_text(const std::string &value, size_t max_len, const char *error) {
   }
 }
 
-Json user_json(const User &user) {
+}  // namespace
+
+Json App::user_json(const User &user) const {
   Json j = Json::object();
   j.o["id"] = Json::integer(user.id);
   j.o["username"] = Json::str(user.username);
@@ -37,15 +40,41 @@ Json user_json(const User &user) {
   return j;
 }
 
-Json message_json(const Message &message) {
+Json App::message_json(const Message &message) const {
   Json j = Json::object();
   j.o["id"] = Json::integer(message.id);
   j.o["dialog_id"] = Json::integer(message.dialog_id);
   j.o["sender_id"] = Json::integer(message.sender_id);
   j.o["text"] = Json::str(message.text);
   j.o["date"] = Json::integer(message.created_at);
+  j.o["kind"] = Json::str(message.kind);
+  j.o["reply_to"] = message.reply_to ? Json::integer(message.reply_to) : Json::nul();
+  j.o["quote"] = Json::str(message.quote);
+  j.o["file_id"] = message.file_id ? Json::integer(message.file_id) : Json::nul();
+  j.o["silent"] = Json::boolean(message.silent);
+  j.o["scheduled_at"] = Json::integer(message.scheduled_at);
+  j.o["edited_at"] = Json::integer(message.edited_at);
+  j.o["entities"] = Json::str(message.entities);
+  j.o["views"] = Json::integer(message.views);
+  j.o["expires_at"] = Json::integer(message.expires_at);
+  j.o["topic_id"] = Json::integer(message.topic_id);
+  j.o["no_forward"] = Json::boolean(message.no_forward);
+  j.o["transcript"] = Json::str(message.transcript);
+  j.o["translation"] = Json::str(message.translation);
+  j.o["translation_lang"] = Json::str(message.translation_lang);
+  Json reactions = Json::array();
+  for (const ReactionCount &reaction : message.reactions) {
+    Json row = Json::object();
+    row.o["emoji"] = Json::str(reaction.emoji);
+    row.o["count"] = Json::integer(reaction.count);
+    row.o["mine"] = Json::boolean(reaction.mine);
+    reactions.a.push_back(std::move(row));
+  }
+  j.o["reactions"] = std::move(reactions);
   return j;
 }
+
+namespace {
 
 int64_t clamp_limit(const Json &params, int64_t fallback, int64_t max_value) {
   auto limit = optional_int(params, "limit");
@@ -74,6 +103,7 @@ void App::handle(Connection &connection, const Json &request) {
     if (params && !params->is_null() && !params->is_object()) throw ApiError(400, "BAD_PARAMS");
     const Json &body = (params && params->is_object()) ? *params : empty;
     if (!public_method(method->s) && connection.user_id() == 0) throw ApiError(401, "UNAUTHORIZED");
+    if (!public_method(method->s)) ensure_session(connection);
     Json result = dispatch(connection, method->s, body);
     Json resp = Json::object();
     resp.o["id"] = std::move(id);
@@ -88,17 +118,50 @@ void App::handle(Connection &connection, const Json &request) {
   }
 }
 
+void App::ensure_session(Connection &connection) {
+  if (connection.token().empty()) {
+    hub_.unbind(&connection);
+    throw ApiError(401, "UNAUTHORIZED");
+  }
+  auto user_id = db_.user_id_by_token(connection.token());
+  if (!user_id || *user_id != connection.user_id()) {
+    hub_.unbind(&connection);
+    throw ApiError(401, "SESSION_REVOKED");
+  }
+}
+
 void App::broadcast_presence(int64_t user_id, bool online) {
   try {
+    if (!online) db_.touch_last_seen(user_id);
     Json data = Json::object();
     data.o["user_id"] = Json::integer(user_id);
     data.o["online"] = Json::boolean(online);
     Json update = Json::object();
     update.o["update"] = Json::str("presence");
     update.o["data"] = std::move(data);
-    hub_.push_many(db_.peer_user_ids(user_id), update, nullptr);
+    hub_.push_many(db_.presence_recipients(user_id), update, nullptr);
   } catch (const std::exception &ex) {
     log_error(std::string("presence: ") + ex.what());
+  }
+}
+
+void App::push_message(const Message &message, Connection *except) {
+  Json update = Json::object();
+  update.o["update"] = Json::str("message.new");
+  update.o["data"] = message_json(message);
+  std::vector<int64_t> ids = db_.member_ids(message.dialog_id);
+  if (message.kind == "sponsor") {
+    std::vector<int64_t> visible;
+    for (int64_t user_id : ids) {
+      if (!db_.premium(user_id)) visible.push_back(user_id);
+    }
+    ids.swap(visible);
+  }
+  hub_.push_many(ids, update, except);
+  try {
+    db_.enqueue_bot_updates(message.dialog_id, message.sender_id, dump_json(update));
+  } catch (const std::exception &ex) {
+    log_error(std::string("bot update: ") + ex.what());
   }
 }
 
@@ -109,6 +172,14 @@ Json App::dialog_json(const DialogInfo &dialog) {
   j.o["title"] = Json::str(dialog.title);
   j.o["member_count"] = Json::integer(dialog.member_count);
   j.o["unread"] = Json::integer(dialog.unread);
+  j.o["archived"] = Json::boolean(dialog.archived);
+  j.o["pinned"] = Json::boolean(dialog.pin_pos > 0);
+  j.o["pin_pos"] = Json::integer(dialog.pin_pos);
+  j.o["muted_until"] = Json::integer(dialog.muted_until);
+  j.o["no_forwards"] = Json::boolean(dialog.no_forwards);
+  j.o["forum"] = Json::boolean(dialog.forum);
+  j.o["ttl_seconds"] = Json::integer(dialog.ttl_seconds);
+  j.o["linked_id"] = dialog.linked_id ? Json::integer(dialog.linked_id) : Json::nul();
   if (dialog.peer) {
     Json peer = user_json(*dialog.peer);
     peer.o["online"] = Json::boolean(hub_.online(dialog.peer->id));
@@ -149,7 +220,10 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
     check_text(display, 64, "BAD_DISPLAY_NAME");
     auto user = db_.create_user(username, password, display);
     if (!user) throw ApiError(409, "USERNAME_TAKEN");
-    std::string token = db_.create_session(user->id);
+    std::string device = optional_string(params, "device").value_or("");
+    std::string platform = optional_string(params, "platform").value_or("");
+    if (device.size() > 64 || platform.size() > 32) throw ApiError(400, "BAD_DEVICE");
+    std::string token = db_.create_session(user->id, device, platform);
     connection.set_token(token);
     hub_.bind_user(&connection, user->id);
     Json result = Json::object();
@@ -163,7 +237,17 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
     std::string password = require_string(params, "password");
     auto user = db_.authenticate(username, password);
     if (!user) throw ApiError(401, "INVALID_CREDENTIALS");
-    std::string token = db_.create_session(user->id);
+    if (db_.has_cloud_password(user->id)) {
+      Json result = Json::object();
+      result.o["need_cloud_password"] = Json::boolean(true);
+      result.o["challenge"] = Json::str(db_.create_challenge(user->id));
+      result.o["user"] = user_json(*user);
+      return result;
+    }
+    std::string device = optional_string(params, "device").value_or("");
+    std::string platform = optional_string(params, "platform").value_or("");
+    if (device.size() > 64 || platform.size() > 32) throw ApiError(400, "BAD_DEVICE");
+    std::string token = db_.create_session(user->id, device, platform);
     connection.set_token(token);
     hub_.bind_user(&connection, user->id);
     Json result = Json::object();
@@ -192,17 +276,47 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
   }
 
   if (method == "users.getMe") {
-    auto user = db_.user_by_id(connection.user_id());
-    if (!user) throw ApiError(401, "UNAUTHORIZED");
-    return user_json(*user);
+    auto prof = db_.profile(connection.user_id());
+    if (!prof) throw ApiError(401, "UNAUTHORIZED");
+    Json result = user_json(*prof);
+    result.o["phone"] = Json::str(prof->phone);
+    result.o["bio"] = Json::str(prof->bio);
+    result.o["photo_file_id"] = prof->photo_file_id ? Json::integer(prof->photo_file_id) : Json::nul();
+    result.o["premium"] = Json::boolean(prof->premium_until > std::time(nullptr));
+    result.o["premium_until"] = Json::integer(prof->premium_until);
+    result.o["is_bot"] = Json::boolean(prof->is_bot);
+    result.o["cloud_password"] = Json::boolean(prof->cloud_password);
+    result.o["preferences"] = Json::str(prof->preferences);
+    result.o["privacy_phone"] = Json::str(prof->privacy_phone);
+    result.o["privacy_last_seen"] = Json::str(prof->privacy_last_seen);
+    result.o["privacy_photo"] = Json::str(prof->privacy_photo);
+    bool premium = prof->premium_until > std::time(nullptr);
+    Json limits = Json::object();
+    limits.o["file_bytes"] = Json::integer(premium ? 4LL * 1024 * 1024 * 1024 : 2LL * 1024 * 1024 * 1024);
+    limits.o["folders"] = Json::integer(premium ? 20 : 10);
+    limits.o["pins"] = Json::integer(premium ? 10 : 5);
+    limits.o["channel_subscriptions"] = Json::integer(premium ? 1000 : 500);
+    limits.o["accounts"] = Json::integer(premium ? 4 : 3);
+    limits.o["download_chunk"] = Json::integer(premium ? 384 * 1024 : 64 * 1024);
+    result.o["limits"] = std::move(limits);
+    return result;
   }
 
   if (method == "users.get") {
     int64_t user_id = require_int(params, "user_id");
-    auto user = db_.user_by_id(user_id);
-    if (!user) throw ApiError(404, "USER_NOT_FOUND");
-    Json result = user_json(*user);
-    result.o["online"] = Json::boolean(hub_.online(user_id));
+    auto prof = db_.profile(user_id);
+    if (!prof) throw ApiError(404, "USER_NOT_FOUND");
+    Json result = user_json(*prof);
+    result.o["bio"] = Json::str(prof->bio);
+    result.o["is_bot"] = Json::boolean(prof->is_bot);
+    result.o["premium"] = Json::boolean(prof->premium_until > std::time(nullptr));
+    bool see_phone = db_.can_see(connection.user_id(), user_id, prof->privacy_phone);
+    bool see_photo = db_.can_see(connection.user_id(), user_id, prof->privacy_photo);
+    bool see_seen = db_.can_see(connection.user_id(), user_id, prof->privacy_last_seen);
+    result.o["phone"] = see_phone ? Json::str(prof->phone) : Json::nul();
+    result.o["photo_file_id"] = see_photo && prof->photo_file_id ? Json::integer(prof->photo_file_id) : Json::nul();
+    result.o["online"] = Json::boolean(see_seen && hub_.online(user_id));
+    result.o["last_seen"] = see_seen ? Json::integer(prof->last_seen_at) : Json::nul();
     return result;
   }
 
@@ -247,8 +361,10 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
   }
 
   if (method == "dialogs.get") {
+    bool archived = false;
+    if (auto flag = optional_bool(params, "archived")) archived = *flag;
     Json arr = Json::array();
-    for (const DialogInfo &dialog : db_.list_dialogs(connection.user_id()))
+    for (const DialogInfo &dialog : db_.list_dialogs(connection.user_id(), archived))
       arr.a.push_back(dialog_json(dialog));
     Json result = Json::object();
     result.o["dialogs"] = std::move(arr);
@@ -282,8 +398,10 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
         members.push_back(item.i);
       }
     }
-    if (members.size() + 1 > 200) throw ApiError(400, "TOO_MANY_MEMBERS");
-    int64_t dialog_id = db_.create_group(connection.user_id(), title, members);
+    if (static_cast<int64_t>(members.size()) + 1 > 200000) throw ApiError(400, "TOO_MANY_MEMBERS");
+    bool forum = false;
+    if (auto flag = optional_bool(params, "forum")) forum = *flag;
+    int64_t dialog_id = db_.create_group(connection.user_id(), title, members, forum);
     push_dialog_new(dialog_id, connection.user_id());
     auto view = db_.dialog_for(connection.user_id(), dialog_id);
     if (!view) throw ApiError(500, "INTERNAL");
@@ -298,7 +416,9 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
     if (head->kind != "group") throw ApiError(400, "NOT_A_GROUP");
     auto role = db_.member_role(dialog_id, connection.user_id());
     if (!role) throw ApiError(403, "NOT_MEMBER");
-    if (*role != "owner") throw ApiError(403, "NOT_OWNER");
+    auto access = db_.membership(dialog_id, connection.user_id());
+    if (!access || !access->can_manage) throw ApiError(403, "NOT_OWNER");
+    if (db_.member_count(dialog_id) >= 200000) throw ApiError(400, "TOO_MANY_MEMBERS");
     auto user = db_.user_by_id(user_id);
     if (!user) throw ApiError(404, "USER_NOT_FOUND");
     bool added = db_.add_member(dialog_id, user_id);
@@ -339,17 +459,59 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
 
   if (method == "messages.send") {
     int64_t dialog_id = require_int(params, "dialog_id");
-    std::string text = require_string(params, "text");
-    if (text.empty() || text.size() > 4096) throw ApiError(400, "BAD_TEXT");
-    for (unsigned char c : text) {
+    Outgoing draft;
+    if (auto text = optional_string(params, "text")) draft.text = *text;
+    if (auto kind = optional_string(params, "kind")) draft.kind = *kind;
+    if (draft.kind.empty()) draft.kind = "text";
+    if (auto quote = optional_string(params, "quote")) draft.quote = *quote;
+    if (auto entities = optional_string(params, "entities")) draft.entities = *entities;
+    if (auto reply = optional_int(params, "reply_to")) draft.reply_to = *reply;
+    if (auto file_id = optional_int(params, "file_id")) draft.file_id = *file_id;
+    if (auto silent = optional_bool(params, "silent")) draft.silent = *silent;
+    if (auto topic = optional_int(params, "topic_id")) draft.topic_id = *topic;
+    if (auto when = optional_int(params, "schedule_at")) draft.scheduled_at = *when;
+    bool media = draft.kind == "voice" || draft.kind == "video_note" || draft.kind == "file" ||
+                 draft.kind == "photo" || draft.kind == "sticker";
+    if (draft.kind != "text" && draft.kind != "voice" && draft.kind != "video_note" &&
+        draft.kind != "file" && draft.kind != "photo" && draft.kind != "sticker" &&
+        draft.kind != "sponsor")
+      throw ApiError(400, "BAD_KIND");
+    if (!media && (draft.text.empty() || draft.text.size() > 4096)) throw ApiError(400, "BAD_TEXT");
+    if (draft.text.size() > 65536) throw ApiError(400, "BAD_TEXT");
+    for (unsigned char c : draft.text) {
       if (c < 0x20 && c != '\n' && c != '\t') throw ApiError(400, "BAD_TEXT");
     }
-    if (!db_.member_role(dialog_id, connection.user_id())) throw ApiError(403, "NOT_MEMBER");
-    Message message = db_.add_message(dialog_id, connection.user_id(), text);
-    Json update = Json::object();
-    update.o["update"] = Json::str("message.new");
-    update.o["data"] = message_json(message);
-    hub_.push_many(db_.member_ids(dialog_id), update, &connection);
+    if (draft.quote.size() > 256) throw ApiError(400, "BAD_QUOTE");
+    if (draft.entities.size() > 4096) throw ApiError(400, "BAD_ENTITIES");
+    auto access = db_.membership(dialog_id, connection.user_id());
+    if (!access) throw ApiError(403, "NOT_MEMBER");
+    if (!access->can_post) throw ApiError(403, "READ_ONLY");
+    auto head = db_.find_dialog(dialog_id);
+    if (!head) throw ApiError(404, "DIALOG_NOT_FOUND");
+    if (draft.kind == "sponsor" && head->kind != "channel") throw ApiError(400, "NOT_A_CHANNEL");
+    if (media && draft.file_id <= 0) throw ApiError(400, "FILE_REQUIRED");
+    if (draft.file_id && !db_.file_info(draft.file_id)) throw ApiError(404, "FILE_NOT_FOUND");
+    if (draft.kind == "sticker") {
+      auto sticker = db_.sticker_by_file(draft.file_id);
+      if (!sticker) throw ApiError(400, "NOT_A_STICKER");
+      auto pack = db_.pack_by_id(sticker->pack_id);
+      if (pack && pack->premium && !db_.premium(connection.user_id())) throw ApiError(403, "PREMIUM_REQUIRED");
+    }
+    if (draft.reply_to) {
+      auto replied = db_.message_by_id(draft.reply_to);
+      if (!replied || replied->dialog_id != dialog_id || replied->deleted) throw ApiError(404, "MESSAGE_NOT_FOUND");
+    }
+    if (draft.topic_id && !db_.topic_in_dialog(dialog_id, draft.topic_id)) throw ApiError(404, "TOPIC_NOT_FOUND");
+    if (draft.scheduled_at < 0 || (draft.scheduled_at > 0 && draft.scheduled_at > std::time(nullptr) + 366L * 86400))
+      throw ApiError(400, "BAD_SCHEDULE");
+    if (head->kind == "secret") {
+      draft.no_forward = true;
+      if (head->ttl_seconds > 0 && draft.scheduled_at == 0)
+        draft.expires_at = static_cast<int64_t>(std::time(nullptr)) + head->ttl_seconds;
+    }
+    if (head->no_forwards) draft.no_forward = true;
+    Message message = db_.add_message(dialog_id, connection.user_id(), draft);
+    if (message.scheduled_at <= message.created_at) push_message(message, &connection);
     return message_json(message);
   }
 
@@ -362,8 +524,14 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
       before_id = *before;
     }
     Json arr = Json::array();
-    for (const Message &message :
-         db_.history(dialog_id, before_id, static_cast<int>(clamp_limit(params, 50, 100))))
+    int64_t topic_id = 0;
+    if (auto topic = optional_int(params, "topic_id")) {
+      if (*topic < 0) throw ApiError(400, "BAD_TOPIC");
+      topic_id = *topic;
+    }
+    for (const Message &message : db_.history(dialog_id, before_id,
+                                             static_cast<int>(clamp_limit(params, 50, 100)),
+                                             connection.user_id(), topic_id))
       arr.a.push_back(message_json(message));
     Json result = Json::object();
     result.o["messages"] = std::move(arr);
@@ -381,7 +549,7 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
     return result;
   }
 
-  throw ApiError(404, "UNKNOWN_METHOD");
+  return dispatch_extra(connection, method, params);
 }
 
 }

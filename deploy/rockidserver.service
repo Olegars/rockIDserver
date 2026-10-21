@@ -1,0 +1,16 @@
+[Unit]
+Description=rockID messenger server
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oleg
+Group=oleg
+WorkingDirectory=/var/www/rockIDserver
+ExecStart=/var/www/rockIDserver/build/rockidserver --port 7410 --db "host=/var/run/postgresql dbname=rockid"
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

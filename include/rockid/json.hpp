@@ -59,5 +59,6 @@ std::string require_string(const Json &object, const char *key);
 int64_t require_int(const Json &object, const char *key);
 std::optional<std::string> optional_string(const Json &object, const char *key);
 std::optional<int64_t> optional_int(const Json &object, const char *key);
+std::optional<bool> optional_bool(const Json &object, const char *key);
 
 }

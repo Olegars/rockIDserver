@@ -4,7 +4,6 @@
 #include "rockid/server.hpp"
 
 #include <csignal>
-#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -17,16 +16,16 @@ void on_signal(int) {
 }
 
 void usage() {
-  std::cerr << "usage: rockidserver [--port N] [--db PATH]\n"
+  std::cerr << "usage: rockidserver [--port N] [--db CONNINFO]\n"
             << "  --port   listen port (default 7410)\n"
-            << "  --db     sqlite database path (default data/rockid.db)\n";
+            << "  --db     PostgreSQL conninfo (default host=/var/run/postgresql dbname=rockid)\n";
 }
 
 }  // namespace
 
 int main(int argc, char **argv) {
   int port = 7410;
-  std::string db_path = "data/rockid.db";
+  std::string conninfo = "host=/var/run/postgresql dbname=rockid";
   try {
     for (int i = 1; i < argc; ++i) {
       std::string arg = argv[i];
@@ -37,7 +36,7 @@ int main(int argc, char **argv) {
       if (arg == "--port" && i + 1 < argc) {
         port = std::stoi(argv[++i]);
       } else if (arg == "--db" && i + 1 < argc) {
-        db_path = argv[++i];
+        conninfo = argv[++i];
       } else {
         usage();
         return 2;
@@ -53,11 +52,7 @@ int main(int argc, char **argv) {
   }
 
   try {
-    std::filesystem::path path(db_path);
-    if (path.has_parent_path() && !path.parent_path().empty())
-      std::filesystem::create_directories(path.parent_path());
-
-    rockid::Database db(db_path);
+    rockid::Database db(conninfo);
     rockid::Server server(port);
     rockid::App app(db, server);
     server.set_app(&app);
@@ -69,7 +64,7 @@ int main(int argc, char **argv) {
     std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
     g_server = &server;
-    rockid::log_info("database " + db_path);
+    rockid::log_info("postgres " + conninfo);
     server.run();
     g_server = nullptr;
   } catch (const std::exception &ex) {

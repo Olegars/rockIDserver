@@ -26,6 +26,7 @@ class Connection {
   void set_token(std::string token) { token_ = std::move(token); }
 
   bool closing() const { return closing_; }
+  void request_close() { closing_ = true; }
   bool want_write() const { return out_pos_ < out_.size(); }
 
   void set_app(App *app) { app_ = app; }

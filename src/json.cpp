@@ -409,4 +409,11 @@ std::optional<int64_t> optional_int(const Json &object, const char *key) {
   return v->i;
 }
 
+std::optional<bool> optional_bool(const Json &object, const char *key) {
+  const Json *v = object.find(key);
+  if (!v || v->is_null()) return std::nullopt;
+  if (!v->is_bool()) throw ApiError(400, "BAD_PARAMS");
+  return v->b;
+}
+
 }

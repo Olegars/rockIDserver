@@ -1,7 +1,10 @@
 #include "rockid/server.hpp"
 
+#include "rockid/app.hpp"
 #include "rockid/connection.hpp"
 #include "rockid/log.hpp"
+
+#include <openssl/sha.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -94,6 +97,7 @@ void Server::run() {
       if (kv.second->closing()) dead.push_back(kv.first);
     }
     for (int fd : dead) close_conn(fd);
+    if (app_) app_->flush_due();
   }
   log_info("server stopped");
 }
@@ -198,6 +202,27 @@ void Server::push_many(const std::vector<int64_t> &user_ids, const Json &message
 bool Server::online(int64_t user_id) const {
   auto it = online_.find(user_id);
   return it != online_.end() && !it->second.empty();
+}
+
+void Server::close_token(int64_t user_id, const std::string &token) {
+  auto it = online_.find(user_id);
+  if (it == online_.end()) return;
+  for (Connection *conn : it->second) {
+    if (conn && conn->token() == token) conn->request_close();
+  }
+}
+
+void Server::close_hash(int64_t user_id, const std::string &token_hash) {
+  auto it = online_.find(user_id);
+  if (it == online_.end()) return;
+  for (Connection *conn : it->second) {
+    if (!conn) continue;
+    unsigned char out[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char *>(conn->token().data()), conn->token().size(), out);
+    if (token_hash.size() == sizeof out &&
+        std::memcmp(out, token_hash.data(), sizeof out) == 0)
+      conn->request_close();
+  }
 }
 
 }
