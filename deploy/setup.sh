@@ -7,13 +7,15 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 svc="rockid"
 port=7410
 http=""
+media=""
 dbname="rockid"
 
 usage() {
-  echo "usage: sudo bash deploy/setup.sh [--user NAME] [--port N] [--http N] [--db NAME]" >&2
+  echo "usage: sudo bash deploy/setup.sh [--user NAME] [--port N] [--http N] [--media N] [--db NAME]" >&2
   echo "  --user   учётная запись службы и роль PostgreSQL (по умолчанию rockid)" >&2
   echo "  --port   порт мессенджера (по умолчанию 7410)" >&2
   echo "  --http   порт мини-приложений и ботов (по умолчанию port+1, 0 выключает)" >&2
+  echo "  --media  порт сырого звука (по умолчанию port+2, 0 выключает)" >&2
   echo "  --db     имя базы (по умолчанию rockid)" >&2
 }
 
@@ -22,6 +24,7 @@ while [[ $# -gt 0 ]]; do
     --user) svc="${2:-}"; shift 2 ;;
     --port) port="${2:-}"; shift 2 ;;
     --http) http="${2:-}"; shift 2 ;;
+    --media) media="${2:-}"; shift 2 ;;
     --db) dbname="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
@@ -48,8 +51,16 @@ fi
 if [[ -z "$http" ]]; then
   http=$((port + 1))
 fi
+if [[ -z "$media" ]]; then
+  media=$((port + 2))
+fi
 if [[ ! "$http" =~ ^[0-9]+$ ]] || (( http < 0 || http > 65535 )) || (( http == port )); then
   echo "Недопустимый HTTP-порт: $http" >&2
+  exit 2
+fi
+if [[ ! "$media" =~ ^[0-9]+$ ]] || (( media < 0 || media > 65535 )) ||
+   (( media != 0 && (media == port || media == http) )); then
+  echo "Недопустимый порт звука: $media" >&2
   exit 2
 fi
 if [[ "$root" == *"\""* || "$root" == *$'\n'* ]]; then
@@ -129,7 +140,7 @@ Type=simple
 User=$svc
 Group=$group
 WorkingDirectory=$root
-ExecStart=$root/build/rockidserver --port $port --http $http --files $root/data/files --db "host=/var/run/postgresql dbname=$dbname"
+ExecStart=$root/build/rockidserver --port $port --http $http --media $media --files $root/data/files --db "host=/var/run/postgresql dbname=$dbname"
 Restart=on-failure
 RestartSec=2
 
@@ -194,4 +205,4 @@ then
   exit 1
 fi
 
-echo "rockidserver слушает порт $port, HTTP $http, пользователь $svc, каталог $root"
+echo "rockidserver слушает порт $port, HTTP $http, звук $media, пользователь $svc, каталог $root"

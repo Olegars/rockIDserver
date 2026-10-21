@@ -1,5 +1,6 @@
 #include "rockid/app.hpp"
 
+#include "call_board.hpp"
 #include "rockid/connection.hpp"
 #include "rockid/log.hpp"
 #include "paths.hpp"
@@ -9,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -188,30 +190,11 @@ std::string call_record_path(int64_t call_id) {
   return files_dir() + "/call-" + std::to_string(call_id) + ".ridm";
 }
 
-void append_call_media(int64_t call_id, const std::string &kind, const std::string &bytes) {
-  std::filesystem::create_directories(files_dir());
-  std::string path = call_record_path(call_id);
-  bool fresh = !std::filesystem::exists(path);
-  std::ofstream out(path, std::ios::binary | std::ios::app);
-  if (!out) return;
-  if (fresh) {
-    char magic[4] = {'R', 'I', 'D', 'M'};
-    out.write(magic, 4);
-  }
-  unsigned char tag = kind == "video" ? 2 : kind == "screen" ? 3 : 1;
-  uint32_t len = static_cast<uint32_t>(bytes.size());
-  unsigned char hdr[5] = {tag, static_cast<unsigned char>((len >> 24) & 0xFF),
-                          static_cast<unsigned char>((len >> 16) & 0xFF),
-                          static_cast<unsigned char>((len >> 8) & 0xFF),
-                          static_cast<unsigned char>(len & 0xFF)};
-  out.write(reinterpret_cast<char *>(hdr), 5);
-  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-}
-
 }  // namespace
 
 void App::flush_due() {
   try {
+    tick_calls();
     DueBatch batch = db_.take_due(static_cast<int64_t>(std::time(nullptr)));
     for (const Message &message : batch.ready) push_message(message, nullptr);
     for (const Message &message : batch.expired) {
@@ -226,6 +209,119 @@ void App::flush_due() {
   } catch (const std::exception &ex) {
     log_error(std::string("flush: ") + ex.what());
   }
+}
+
+Json App::room_json(const LiveRoom &room) const {
+  Json peers = Json::array();
+  for (const LivePeer &peer : room.peers) {
+    Json row = Json::object();
+    row.o["user_id"] = Json::integer(peer.user_id);
+    row.o["muted"] = Json::boolean(peer.muted);
+    row.o["video"] = Json::boolean(peer.video);
+    row.o["screen"] = Json::boolean(peer.screen);
+    peers.a.push_back(std::move(row));
+  }
+  Json data = Json::object();
+  data.o["id"] = Json::integer(room.id);
+  data.o["dialog_id"] = Json::integer(room.dialog_id);
+  data.o["active"] = Json::boolean(room.active);
+  data.o["recording"] = Json::boolean(room.recording);
+  data.o["media_port"] = Json::integer(media_port_);
+  data.o["peers"] = std::move(peers);
+  return data;
+}
+
+void App::push_room(const LiveRoom &room, const char *name, Connection *except) {
+  if (room.id == 0 || room.dialog_id == 0) return;
+  Json update = Json::object();
+  update.o["update"] = Json::str(name);
+  update.o["data"] = room_json(room);
+  hub_.push_many(db_.member_ids(room.dialog_id), update, except);
+}
+
+bool App::save_call_recording(int64_t user_id, int64_t call_id) {
+  if (user_id == 0) return false;
+  calls_->sync();
+  std::string recorded = call_record_path(call_id);
+  std::error_code ec;
+  auto recorded_size = std::filesystem::file_size(recorded, ec);
+  if (ec || recorded_size <= 4) return false;
+  int64_t saved = db_.saved_dialog(user_id);
+  Outgoing draft;
+  draft.kind = "file";
+  draft.text = "запись эфира";
+  FileInfo stored = db_.create_file(user_id, "call-" + std::to_string(call_id) + ".ridm",
+                                    "application/x-rockid-call", static_cast<int64_t>(recorded_size));
+  std::filesystem::rename(recorded, file_path(stored.id), ec);
+  if (ec) return false;
+  db_.file_received(stored.id, static_cast<int64_t>(recorded_size), true);
+  draft.file_id = stored.id;
+  Message note = db_.add_message(saved, user_id, draft);
+  push_message(note, nullptr);
+  return true;
+}
+
+Json App::drop_peer(int64_t call_id, int64_t user_id, Connection *except) {
+  LiveRoom room = calls_->leave(call_id, user_id);
+  if (room.id == 0) return Json::object();
+  db_.leave_call(call_id, user_id);
+  if (!room.active && room.recording) save_call_recording(room.recorder_id, call_id);
+  if (!room.active) push_room(room, "call.ended", except);
+  push_room(room, "call.update", except);
+  return room_json(room);
+}
+
+void App::finish_call(int64_t call_id) {
+  LiveRoom room = calls_->take(call_id);
+  if (room.id == 0) return;
+  for (const LivePeer &peer : room.peers) db_.leave_call(call_id, peer.user_id);
+  bool recording = room.recording;
+  int64_t recorder = room.recorder_id;
+  room.active = false;
+  room.recording = false;
+  if (recording) save_call_recording(recorder, call_id);
+  push_room(room, "call.ended", nullptr);
+  push_room(room, "call.update", nullptr);
+}
+
+void App::leave_live(int64_t user_id) {
+  for (int64_t call_id : calls_->calls_of(user_id)) drop_peer(call_id, user_id, nullptr);
+}
+
+void App::tick_calls() {
+  int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+  for (int64_t call_id : calls_->expired(now)) finish_call(call_id);
+}
+
+int App::accept_media(const std::string &token, int64_t call_id, int64_t &user_id) {
+  auto id = db_.user_id_by_token(token);
+  if (!id) return 401;
+  user_id = *id;
+  LiveRoom room = calls_->view(call_id);
+  if (room.id == 0) return 404;
+  for (const LivePeer &peer : room.peers) {
+    if (peer.user_id == user_id) return 0;
+  }
+  return 404;
+}
+
+int App::accept_audio(int64_t user_id, int64_t call_id, const std::string &bytes, uint32_t &seq, int64_t &ts,
+                      std::vector<int64_t> &peers) {
+  uint32_t seq_out = 0;
+  int64_t ts_out = 0;
+  CallBoard::Admit admit = calls_->admit(call_id, user_id, 1, bytes, seq_out, ts_out);
+  if (admit == CallBoard::Admit::Absent) return 2;
+  if (admit != CallBoard::Admit::Ok) return 1;
+  seq = seq_out;
+  ts = ts_out;
+  peers.clear();
+  LiveRoom room = calls_->view(call_id);
+  for (const LivePeer &peer : room.peers) {
+    if (peer.user_id != user_id) peers.push_back(peer.user_id);
+  }
+  return 0;
 }
 
 Json App::dispatch_extra(Connection &connection, const std::string &method, const Json &params) {
@@ -1079,49 +1175,46 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
 
   if (method == "calls.start" || method == "calls.join" || method == "calls.leave" ||
       method == "calls.setState" || method == "calls.record") {
-    int64_t call_id = 0;
-    CallInfo call;
     if (method == "calls.start") {
       int64_t dialog_id = require_int(params, "dialog_id");
       require_dialog(dialog_id);
-      call = db_.start_call(dialog_id, me);
-      call_id = call.id;
-    } else {
-      call_id = require_int(params, "call_id");
-      auto loaded = db_.call_by_id(call_id);
-      if (!loaded || !loaded->active) throw ApiError(404, "CALL_NOT_FOUND");
-      call = *loaded;
-      require_dialog(call.dialog_id);
+      CallInfo call = db_.start_call(dialog_id, me);
+      int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+      calls_->open(call.id, dialog_id, me, now);
+      LiveRoom room = calls_->view(call.id);
+      push_room(room, "call.update", &connection);
+      push_room(room, "call.ring", &connection);
+      return room_json(room);
     }
-    if (method == "calls.join" || method == "calls.start") db_.join_call(call_id, me);
-    if (method == "calls.leave") db_.leave_call(call_id, me);
-    if (method == "calls.setState") {
-      db_.set_call_state(call_id, me, optional_bool(params, "muted").value_or(false),
-                         optional_bool(params, "video").value_or(false),
-                         optional_bool(params, "screen").value_or(false));
-    }
-    if (method == "calls.record") {
+    int64_t call_id = require_int(params, "call_id");
+    LiveRoom existing = calls_->view(call_id);
+    if (existing.id == 0) throw ApiError(404, "CALL_NOT_FOUND");
+    require_dialog(existing.dialog_id);
+    if (method == "calls.join") {
+      if (!calls_->join(call_id, me)) throw ApiError(404, "CALL_NOT_FOUND");
+      db_.join_call(call_id, me);
+    } else if (method == "calls.leave") {
+      Json left = drop_peer(call_id, me, &connection);
+      if (left.o["id"].i == 0) throw ApiError(403, "NOT_IN_CALL");
+      return left;
+    } else if (method == "calls.setState") {
+      bool muted = optional_bool(params, "muted").value_or(false);
+      bool video = optional_bool(params, "video").value_or(false);
+      bool screen = optional_bool(params, "screen").value_or(false);
+      if (!calls_->set_state(call_id, me, muted, video, screen)) throw ApiError(403, "NOT_IN_CALL");
+      db_.set_call_state(call_id, me, muted, video, screen);
+    } else if (method == "calls.record") {
       bool recording = optional_bool(params, "recording").value_or(true);
+      if (!calls_->set_recording(call_id, me, recording)) throw ApiError(403, "NOT_IN_CALL");
       db_.set_call_recording(call_id, recording);
-      if (recording) {
-        std::filesystem::remove(call_record_path(call_id));
-      } else {
+      if (!recording && !save_call_recording(me, call_id)) {
         int64_t saved = db_.saved_dialog(me);
         Outgoing draft;
         draft.kind = "file";
         draft.text = "запись эфира";
-        std::string recorded = call_record_path(call_id);
-        std::error_code ec;
-        auto recorded_size = std::filesystem::file_size(recorded, ec);
-        if (!ec && recorded_size > 4) {
-          FileInfo stored = db_.create_file(me, "call-" + std::to_string(call_id) + ".ridm",
-                                            "application/x-rockid-call", static_cast<int64_t>(recorded_size));
-          std::filesystem::rename(recorded, file_path(stored.id), ec);
-          if (!ec) {
-            db_.file_received(stored.id, static_cast<int64_t>(recorded_size), true);
-            draft.file_id = stored.id;
-          }
-        } else if (auto file_id = optional_int(params, "file_id")) {
+        if (auto file_id = optional_int(params, "file_id")) {
           if (!db_.can_read_file(me, *file_id)) throw ApiError(404, "FILE_NOT_FOUND");
           draft.file_id = *file_id;
         } else {
@@ -1131,27 +1224,10 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
         push_message(note, nullptr);
       }
     }
-    Json peers = Json::array();
-    for (const CallPeer &peer : db_.call_peers(call_id)) {
-      Json row = Json::object();
-      row.o["user_id"] = Json::integer(peer.user_id);
-      row.o["muted"] = Json::boolean(peer.muted);
-      row.o["video"] = Json::boolean(peer.video);
-      row.o["screen"] = Json::boolean(peer.screen);
-      peers.a.push_back(std::move(row));
-    }
-    auto fresh = db_.call_by_id(call_id);
-    Json data = Json::object();
-    data.o["id"] = Json::integer(call_id);
-    data.o["dialog_id"] = Json::integer(call.dialog_id);
-    data.o["active"] = Json::boolean(fresh && fresh->active);
-    data.o["recording"] = Json::boolean(fresh && fresh->recording);
-    data.o["peers"] = peers;
-    Json update = Json::object();
-    update.o["update"] = Json::str("call.update");
-    update.o["data"] = data;
-    hub_.push_many(db_.member_ids(call.dialog_id), update, &connection);
-    return data;
+    LiveRoom room = calls_->view(call_id);
+    if (room.id == 0) return room_json(existing);
+    push_room(room, "call.update", &connection);
+    return room_json(room);
   }
 
   if (method == "bots.create") {
@@ -1308,26 +1384,34 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
   if (method == "calls.media") {
     int64_t call_id = require_int(params, "call_id");
     std::string kind = require_string(params, "kind");
-    if (kind != "audio" && kind != "video" && kind != "screen") throw ApiError(400, "BAD_KIND");
+    if (kind == "audio") throw ApiError(400, "USE_MEDIA_SOCKET");
+    if (kind != "video" && kind != "screen") throw ApiError(400, "BAD_KIND");
     std::string bytes = b64_decode(require_string(params, "data"));
     if (bytes.empty() || bytes.size() > 256 * 1024) throw ApiError(400, "BAD_CHUNK");
-    auto call = db_.call_by_id(call_id);
-    if (!call || !call->active) throw ApiError(404, "CALL_NOT_FOUND");
-    require_dialog(call->dialog_id);
-    if (db_.call_recording(call_id)) append_call_media(call_id, kind, bytes);
+    LiveRoom room = calls_->view(call_id);
+    if (room.id == 0) throw ApiError(404, "CALL_NOT_FOUND");
+    uint32_t seq = 0;
+    int64_t ts = 0;
+    CallBoard::Admit admit = calls_->admit(call_id, me, kind == "screen" ? 3 : 2, bytes, seq, ts);
+    if (admit == CallBoard::Admit::Absent) throw ApiError(403, "NOT_IN_CALL");
+    if (admit == CallBoard::Admit::Limited) throw ApiError(429, "RATE_LIMIT");
     Json data = Json::object();
     data.o["call_id"] = Json::integer(call_id);
     data.o["user_id"] = Json::integer(me);
     data.o["kind"] = Json::str(kind);
+    data.o["seq"] = Json::integer(seq);
+    data.o["ts"] = Json::integer(ts);
     data.o["data"] = Json::str(b64_encode(bytes));
     Json update = Json::object();
     update.o["update"] = Json::str("call.media");
-    update.o["data"] = std::move(data);
-    for (const CallPeer &peer : db_.call_peers(call_id)) {
+    update.o["data"] = data;
+    for (const LivePeer &peer : room.peers) {
       if (peer.user_id != me) hub_.push_user(peer.user_id, update, nullptr);
     }
     Json result = Json::object();
     result.o["bytes"] = Json::integer(static_cast<int64_t>(bytes.size()));
+    result.o["seq"] = Json::integer(seq);
+    result.o["ts"] = Json::integer(ts);
     return result;
   }
 

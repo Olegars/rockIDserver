@@ -325,6 +325,8 @@ void Database::migrate() {
       "  user_id BIGINT PRIMARY KEY REFERENCES users(id),"
       "  public_key BYTEA NOT NULL"
       ")",
+      "UPDATE calls SET active = FALSE, recording = FALSE WHERE active = TRUE",
+      "DELETE FROM call_members",
   };
   for (const char *sql : statements) exec(sql);
 }

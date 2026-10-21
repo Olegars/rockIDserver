@@ -1,5 +1,6 @@
 #include "rockid/app.hpp"
 
+#include "call_board.hpp"
 #include "rockid/connection.hpp"
 #include "rockid/log.hpp"
 #include "seal.hpp"
@@ -86,7 +87,9 @@ int64_t clamp_limit(const Json &params, int64_t fallback, int64_t max_value) {
 
 }  // namespace
 
-App::App(Database &db, Hub &hub) : db_(db), hub_(hub) {}
+App::App(Database &db, Hub &hub) : db_(db), hub_(hub), calls_(std::make_unique<CallBoard>()) {}
+
+App::~App() = default;
 
 void App::handle(Connection &connection, const Json &request) {
   Json id = Json::nul();
@@ -174,7 +177,7 @@ void App::flush_offline(int64_t user_id) {
 void App::remember_offline(int64_t user_id, const Json &message) {
   const Json *update = message.find("update");
   if (!update || !update->is_string()) return;
-  if (update->s == "presence" || update->s == "call.media") return;
+  if (update->s == "presence" || update->s == "call.media" || update->s == "call.update") return;
   try {
     db_.queue_push(user_id, dump_json(message));
   } catch (const std::exception &ex) {
@@ -184,6 +187,7 @@ void App::remember_offline(int64_t user_id, const Json &message) {
 
 void App::broadcast_presence(int64_t user_id, bool online) {
   try {
+    if (!online) leave_live(user_id);
     db_.set_user_online(user_id, online);
     if (!online) db_.touch_last_seen(user_id);
     Json data = Json::object();

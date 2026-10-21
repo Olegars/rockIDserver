@@ -32,6 +32,7 @@ add_executable(rockidserver
   src/connection.cpp
   src/server.cpp
   src/seal.cpp
+  src/call_board.cpp
   src/app.cpp
   src/app_features.cpp
 )

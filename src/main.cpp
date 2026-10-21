@@ -17,10 +17,11 @@ void on_signal(int) {
 }
 
 void usage() {
-  std::cerr << "usage: rockidserver [--port N] [--http N] [--db CONNINFO] [--files DIR]\n"
+  std::cerr << "usage: rockidserver [--port N] [--http N] [--media N] [--db CONNINFO] [--files DIR]\n"
             << "                  [--tls-cert PEM --tls-key PEM]\n"
             << "  --port      messenger port (default 7410)\n"
             << "  --http      mini app and bot API port (default 7411, 0 disables)\n"
+            << "  --media     raw audio port (default port+2, 0 disables)\n"
             << "  --db        PostgreSQL conninfo (default host=/var/run/postgresql dbname=rockid)\n"
             << "  --files     directory for uploaded files\n"
             << "  --tls-cert  PEM certificate for the messenger port\n"
@@ -32,6 +33,7 @@ void usage() {
 int main(int argc, char **argv) {
   int port = 7410;
   int http_port = 7411;
+  int media_port = -1;
   std::string conninfo = "host=/var/run/postgresql dbname=rockid";
   std::string files;
   std::string cert;
@@ -47,6 +49,8 @@ int main(int argc, char **argv) {
         port = std::stoi(argv[++i]);
       } else if (arg == "--http" && i + 1 < argc) {
         http_port = std::stoi(argv[++i]);
+      } else if (arg == "--media" && i + 1 < argc) {
+        media_port = std::stoi(argv[++i]);
       } else if (arg == "--db" && i + 1 < argc) {
         conninfo = argv[++i];
       } else if (arg == "--files" && i + 1 < argc) {
@@ -64,7 +68,9 @@ int main(int argc, char **argv) {
     usage();
     return 2;
   }
-  if (port < 1 || port > 65535 || http_port < 0 || http_port > 65535 || http_port == port) {
+  if (media_port < 0) media_port = port + 2;
+  if (port < 1 || port > 65535 || http_port < 0 || http_port > 65535 || media_port < 0 ||
+      media_port > 65535 || http_port == port || (media_port != 0 && (media_port == port || media_port == http_port))) {
     usage();
     return 2;
   }
@@ -73,10 +79,11 @@ int main(int argc, char **argv) {
     rockid::Database db(conninfo);
     if (!db.lock_instance()) throw std::runtime_error("another rockidserver holds this database");
     if (!files.empty()) rockid::files_dir() = files;
-    rockid::Server server(port, http_port);
+    rockid::Server server(port, http_port, media_port);
     if ((!cert.empty() || !key.empty()) && !server.enable_tls(cert, key))
       throw std::runtime_error("tls setup failed");
     rockid::App app(db, server);
+    app.set_media_port(server.media_port());
     server.set_app(&app);
     server.set_offline_handler([&app](int64_t user_id, const rockid::Json &message) {
       app.remember_offline(user_id, message);
