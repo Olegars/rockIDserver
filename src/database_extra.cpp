@@ -66,6 +66,7 @@ Invoice read_invoice(Query &q) {
   invoice.purpose = q.text(6);
   invoice.status = q.text(7);
   invoice.provider_ref = q.text(8);
+  invoice.pay_url = q.text(9);
   return invoice;
 }
 
@@ -1152,31 +1153,34 @@ std::optional<MiniApp> Database::create_app(int64_t owner, const std::string &ti
     throw;
   }
   if (!q.next()) throw std::runtime_error("app insert returned no id");
-  return MiniApp{q.i64(0), owner, title, short_name, url};
+  return MiniApp{q.i64(0), owner, title, short_name, url, {}};
 }
 
 std::optional<MiniApp> Database::app_by_name(const std::string &short_name) {
-  Query q(db_, "SELECT id, owner_id, title, short_name, url FROM mini_apps WHERE lower(short_name) = lower($1)");
+  Query q(db_,
+          "SELECT id, owner_id, title, short_name, url, content FROM mini_apps "
+          "WHERE lower(short_name) = lower($1)");
   q.bind(1, short_name);
   q.exec();
   if (!q.next()) return std::nullopt;
-  return MiniApp{q.i64(0), q.i64(1), q.text(2), q.text(3), q.text(4)};
+  return MiniApp{q.i64(0), q.i64(1), q.text(2), q.text(3), q.text(4), q.text(5)};
 }
 
 std::vector<MiniApp> Database::list_apps() {
-  Query q(db_, "SELECT id, owner_id, title, short_name, url FROM mini_apps ORDER BY id");
+  Query q(db_, "SELECT id, owner_id, title, short_name, url, content FROM mini_apps ORDER BY id");
   q.exec();
   std::vector<MiniApp> rows;
-  while (q.next()) rows.push_back(MiniApp{q.i64(0), q.i64(1), q.text(2), q.text(3), q.text(4)});
+  while (q.next()) rows.push_back(MiniApp{q.i64(0), q.i64(1), q.text(2), q.text(3), q.text(4), q.text(5)});
   return rows;
 }
 
 Invoice Database::create_invoice(int64_t bot_id, int64_t user_id, const std::string &title, int64_t amount,
-                                 const std::string &currency, const std::string &purpose) {
+                                 const std::string &currency, const std::string &purpose,
+                                 const std::string &pay_url) {
   Query q(db_,
-          "INSERT INTO invoices(bot_id, user_id, title, amount, currency, purpose, status, created_at) "
-          "VALUES($1,$2,$3,$4,$5,$6,'pending',$7) "
-          "RETURNING id, bot_id, user_id, title, amount, currency, purpose, status, provider_ref");
+          "INSERT INTO invoices(bot_id, user_id, title, amount, currency, purpose, status, created_at, pay_url) "
+          "VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8) "
+          "RETURNING id, bot_id, user_id, title, amount, currency, purpose, status, provider_ref, pay_url");
   q.bind(1, bot_id);
   q.bind(2, user_id);
   q.bind(3, title);
@@ -1184,6 +1188,7 @@ Invoice Database::create_invoice(int64_t bot_id, int64_t user_id, const std::str
   q.bind(5, currency);
   q.bind(6, purpose);
   q.bind(7, now_s());
+  q.bind(8, pay_url);
   q.exec();
   if (!q.next()) throw std::runtime_error("invoice insert returned no id");
   return read_invoice(q);
@@ -1191,7 +1196,7 @@ Invoice Database::create_invoice(int64_t bot_id, int64_t user_id, const std::str
 
 std::optional<Invoice> Database::invoice_by_id(int64_t id) {
   Query q(db_,
-          "SELECT id, bot_id, user_id, title, amount, currency, purpose, status, provider_ref "
+          "SELECT id, bot_id, user_id, title, amount, currency, purpose, status, provider_ref, pay_url "
           "FROM invoices WHERE id = $1");
   q.bind(1, id);
   q.exec();
@@ -1201,7 +1206,7 @@ std::optional<Invoice> Database::invoice_by_id(int64_t id) {
 
 std::vector<Invoice> Database::list_invoices(int64_t user_id) {
   Query q(db_,
-          "SELECT id, bot_id, user_id, title, amount, currency, purpose, status, provider_ref "
+          "SELECT id, bot_id, user_id, title, amount, currency, purpose, status, provider_ref, pay_url "
           "FROM invoices WHERE user_id = $1 OR bot_id = $1 ORDER BY id DESC LIMIT 50");
   q.bind(1, user_id);
   q.exec();
@@ -1221,6 +1226,116 @@ bool Database::set_invoice_status(int64_t id, int64_t bot_id, const std::string 
   q.bind(4, provider_ref);
   q.exec();
   return q.affected() > 0;
+}
+
+bool Database::lock_instance() {
+  Query q(db_, "SELECT pg_try_advisory_lock(741051)");
+  q.exec();
+  return q.next() && pg_flag(q.text(0));
+}
+
+void Database::set_user_online(int64_t user_id, bool online) {
+  Query q(db_, "UPDATE users SET online = $2::boolean, last_seen_at = $3 WHERE id = $1");
+  q.bind(1, user_id);
+  q.bind(2, flag(online));
+  q.bind(3, now_s());
+  q.exec();
+}
+
+void Database::queue_push(int64_t user_id, const std::string &payload) {
+  if (payload.size() > 64 * 1024) return;
+  Query ins(db_, "INSERT INTO offline_pushes(user_id, payload, created_at) VALUES($1,$2,$3)");
+  ins.bind(1, user_id);
+  ins.bind(2, payload);
+  ins.bind(3, now_s());
+  ins.exec();
+  Query trim(db_,
+             "DELETE FROM offline_pushes WHERE user_id = $1 AND id NOT IN ("
+             "SELECT id FROM offline_pushes WHERE user_id = $1 ORDER BY id DESC LIMIT 500)");
+  trim.bind(1, user_id);
+  trim.exec();
+}
+
+std::vector<std::string> Database::take_pushes(int64_t user_id) {
+  Query q(db_,
+          "WITH picked AS (SELECT id, payload FROM offline_pushes WHERE user_id = $1 ORDER BY id LIMIT 200) "
+          "DELETE FROM offline_pushes o USING picked p WHERE o.id = p.id RETURNING p.id, p.payload");
+  q.bind(1, user_id);
+  q.exec();
+  std::vector<std::pair<int64_t, std::string>> rows;
+  while (q.next()) rows.push_back({q.i64(0), q.text(1)});
+  std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+  std::vector<std::string> out;
+  for (const auto &row : rows) out.push_back(row.second);
+  return out;
+}
+
+int64_t Database::claim_device(const std::string &device_id, int64_t user_id, bool premium_user) {
+  Query exists(db_, "SELECT 1 FROM device_accounts WHERE device_id = $1 AND user_id = $2");
+  exists.bind(1, device_id);
+  exists.bind(2, user_id);
+  exists.exec();
+  bool already = exists.next();
+  Query count(db_, "SELECT COUNT(*) FROM device_accounts WHERE device_id = $1");
+  count.bind(1, device_id);
+  count.exec();
+  int64_t n = count.next() ? count.i64(0) : 0;
+  int64_t cap = premium_user ? 4 : 3;
+  if (!already && n >= cap) return n + 1;
+  if (!already) {
+    Query ins(db_, "INSERT INTO device_accounts(device_id, user_id, created_at) VALUES($1,$2,$3)");
+    ins.bind(1, device_id);
+    ins.bind(2, user_id);
+    ins.bind(3, now_s());
+    ins.exec();
+    ++n;
+  }
+  return n;
+}
+
+void Database::publish_key(int64_t user_id, const std::string &public_key) {
+  Query q(db_,
+          "INSERT INTO user_keys(user_id, public_key) VALUES($1,$2) "
+          "ON CONFLICT (user_id) DO UPDATE SET public_key = EXCLUDED.public_key");
+  q.bind(1, user_id);
+  q.bind_blob(2, public_key.data(), static_cast<int>(public_key.size()));
+  q.exec();
+}
+
+std::vector<std::pair<int64_t, std::string>> Database::keys_for_dialog(int64_t dialog_id) {
+  Query q(db_,
+          "SELECT m.user_id, k.public_key FROM members m "
+          "JOIN user_keys k ON k.user_id = m.user_id "
+          "WHERE m.dialog_id = $1 AND m.banned = FALSE");
+  q.bind(1, dialog_id);
+  q.exec();
+  std::vector<std::pair<int64_t, std::string>> rows;
+  while (q.next()) rows.push_back({q.i64(0), q.blob(1)});
+  return rows;
+}
+
+bool Database::set_app_content(int64_t owner, const std::string &short_name, const std::string &html) {
+  Query q(db_, "UPDATE mini_apps SET content = $3 WHERE owner_id = $1 AND lower(short_name) = lower($2)");
+  q.bind(1, owner);
+  q.bind(2, short_name);
+  q.bind(3, html);
+  q.exec();
+  return q.affected() > 0;
+}
+
+void Database::update_file_meta(int64_t id, const std::string &mime, int64_t size) {
+  Query q(db_, "UPDATE files SET mime = $2, size = $3, received = $3, ready = TRUE WHERE id = $1");
+  q.bind(1, id);
+  q.bind(2, mime);
+  q.bind(3, size);
+  q.exec();
+}
+
+bool Database::call_recording(int64_t call_id) {
+  Query q(db_, "SELECT recording::int FROM calls WHERE id = $1");
+  q.bind(1, call_id);
+  q.exec();
+  return q.next() && pg_flag(q.text(0));
 }
 
 }

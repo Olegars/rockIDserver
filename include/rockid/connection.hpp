@@ -2,6 +2,8 @@
 
 #include "rockid/json.hpp"
 
+#include <openssl/ssl.h>
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -31,6 +33,8 @@ class Connection {
 
   void set_app(App *app) { app_ = app; }
   void set_on_output(std::function<void(Connection &)> cb) { on_output_ = std::move(cb); }
+  void enable_tls(SSL_CTX *ctx);
+  void set_compress(bool enabled) { compress_ = enabled; }
 
   void send(const Json &message);
   bool on_read();
@@ -39,6 +43,9 @@ class Connection {
  private:
   void handle_payload(const std::string &payload);
   bool pull_frames();
+  bool handshake();
+  ssize_t read_some(char *buf, size_t n);
+  ssize_t write_some(const char *buf, size_t n);
 
   int fd_ = -1;
   int64_t user_id_ = 0;
@@ -47,6 +54,8 @@ class Connection {
   std::string out_;
   size_t out_pos_ = 0;
   bool closing_ = false;
+  bool compress_ = false;
+  SSL *ssl_ = nullptr;
   App *app_ = nullptr;
   std::function<void(Connection &)> on_output_;
 };

@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 
 find_path(LIBPQ_INCLUDE_DIR libpq-fe.h)
 if(NOT LIBPQ_INCLUDE_DIR)
@@ -30,6 +31,7 @@ add_executable(rockidserver
   src/database_extra.cpp
   src/connection.cpp
   src/server.cpp
+  src/seal.cpp
   src/app.cpp
   src/app_features.cpp
 )
@@ -40,7 +42,9 @@ target_include_directories(rockidserver PRIVATE
 )
 
 target_link_libraries(rockidserver PRIVATE
+  OpenSSL::SSL
   OpenSSL::Crypto
+  ZLIB::ZLIB
   ${LIBPQ_LIBRARY}
   pthread
 )

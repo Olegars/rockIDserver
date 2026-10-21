@@ -2,8 +2,12 @@
 
 #include "rockid/connection.hpp"
 #include "rockid/log.hpp"
+#include "paths.hpp"
 
 #include <openssl/rand.h>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <ctime>
 #include <filesystem>
@@ -16,13 +20,10 @@ namespace {
 constexpr int64_t kMaxGroup = 200000;
 constexpr int64_t kFreeFile = 2LL * 1024 * 1024 * 1024;
 constexpr int64_t kPremiumFile = 4LL * 1024 * 1024 * 1024;
-constexpr int64_t kWriteChunk = 384 * 1024;
+constexpr int64_t kFreeChunk = 384 * 1024;
+constexpr int64_t kPremiumChunk = 700 * 1024;
 constexpr int64_t kFreeRead = 64 * 1024;
-constexpr int64_t kPremiumRead = 384 * 1024;
-
-std::string file_path(int64_t id) {
-  return "/var/www/rockIDserver/data/files/" + std::to_string(id);
-}
+constexpr int64_t kPremiumRead = 700 * 1024;
 
 int b64_value(char c) {
   if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -133,7 +134,78 @@ Json invoice_json(const Invoice &invoice) {
   j.o["purpose"] = Json::str(invoice.purpose);
   j.o["status"] = Json::str(invoice.status);
   j.o["provider_ref"] = Json::str(invoice.provider_ref);
+  j.o["pay_url"] = Json::str(invoice.pay_url);
   return j;
+}
+
+bool run_argv(const std::vector<std::string> &args) {
+  std::vector<char *> argv;
+  argv.reserve(args.size() + 1);
+  for (const std::string &arg : args) argv.push_back(const_cast<char *>(arg.c_str()));
+  argv.push_back(nullptr);
+  pid_t pid = ::fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    ::execvp(argv[0], argv.data());
+    _exit(127);
+  }
+  int status = 0;
+  if (::waitpid(pid, &status, 0) < 0) return false;
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+void normalize_media(FileInfo &info) {
+  bool audio = info.mime.rfind("audio/", 0) == 0;
+  bool video = info.mime.rfind("video/", 0) == 0;
+  if (!audio && !video) return;
+  std::string src = file_path(info.id);
+  std::string dst = src + (audio ? ".ogg" : ".mp4");
+  std::vector<std::string> args;
+  if (audio) {
+    args = {"ffmpeg", "-y", "-i", src, "-c:a", "libopus", "-b:a", "32k", dst};
+  } else {
+    args = {"ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac",
+            "-movflags", "+faststart", dst};
+  }
+  if (!run_argv(args)) {
+    std::filesystem::remove(dst);
+    return;
+  }
+  std::error_code ec;
+  auto size = std::filesystem::file_size(dst, ec);
+  if (ec || size == 0) {
+    std::filesystem::remove(dst);
+    return;
+  }
+  std::filesystem::rename(dst, src, ec);
+  if (ec) return;
+  info.mime = audio ? "audio/ogg" : "video/mp4";
+  info.size = static_cast<int64_t>(size);
+  info.received = info.size;
+}
+
+std::string call_record_path(int64_t call_id) {
+  return files_dir() + "/call-" + std::to_string(call_id) + ".ridm";
+}
+
+void append_call_media(int64_t call_id, const std::string &kind, const std::string &bytes) {
+  std::filesystem::create_directories(files_dir());
+  std::string path = call_record_path(call_id);
+  bool fresh = !std::filesystem::exists(path);
+  std::ofstream out(path, std::ios::binary | std::ios::app);
+  if (!out) return;
+  if (fresh) {
+    char magic[4] = {'R', 'I', 'D', 'M'};
+    out.write(magic, 4);
+  }
+  unsigned char tag = kind == "video" ? 2 : kind == "screen" ? 3 : 1;
+  uint32_t len = static_cast<uint32_t>(bytes.size());
+  unsigned char hdr[5] = {tag, static_cast<unsigned char>((len >> 24) & 0xFF),
+                          static_cast<unsigned char>((len >> 16) & 0xFF),
+                          static_cast<unsigned char>((len >> 8) & 0xFF),
+                          static_cast<unsigned char>(len & 0xFF)};
+  out.write(reinterpret_cast<char *>(hdr), 5);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
 }  // namespace
@@ -171,6 +243,7 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
     std::string device = optional_string(params, "device").value_or("");
     std::string platform = optional_string(params, "platform").value_or("");
     if (device.size() > 64 || platform.size() > 32) throw ApiError(400, "BAD_DEVICE");
+    claim_device(user->id, params);
     std::string token = db_.create_session(user->id, device, platform);
     connection.set_token(token);
     hub_.bind_user(&connection, user->id);
@@ -651,11 +724,11 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
     int64_t cap = db_.premium(me) ? kPremiumFile : kFreeFile;
     if (size < 1 || size > cap) throw ApiError(400, "BAD_SIZE");
     FileInfo info = db_.create_file(me, name, mime, size);
-    std::filesystem::create_directories("/var/www/rockIDserver/data/files");
+    std::filesystem::create_directories(files_dir());
     std::ofstream created(file_path(info.id), std::ios::binary | std::ios::trunc);
     if (!created) throw ApiError(500, "FILE_IO");
     Json result = file_json(info);
-    result.o["chunk_bytes"] = Json::integer(kWriteChunk);
+    result.o["chunk_bytes"] = Json::integer(db_.premium(me) ? kPremiumChunk : kFreeChunk);
     return result;
   }
 
@@ -666,7 +739,8 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
     auto info = db_.file_info(file_id);
     if (!info || info->owner_id != me) throw ApiError(404, "FILE_NOT_FOUND");
     if (info->ready) throw ApiError(400, "FILE_CLOSED");
-    if (offset != info->received || data.empty() || static_cast<int64_t>(data.size()) > kWriteChunk)
+    int64_t chunk_cap = db_.premium(me) ? kPremiumChunk : kFreeChunk;
+    if (offset != info->received || data.empty() || static_cast<int64_t>(data.size()) > chunk_cap)
       throw ApiError(400, "BAD_CHUNK");
     if (info->received + static_cast<int64_t>(data.size()) > info->size) throw ApiError(400, "BAD_CHUNK");
     std::fstream out(file_path(file_id), std::ios::binary | std::ios::in | std::ios::out);
@@ -688,7 +762,102 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
     if (info->received != info->size) throw ApiError(400, "INCOMPLETE");
     db_.file_received(file_id, info->received, true);
     info->ready = true;
+    normalize_media(*info);
+    db_.update_file_meta(info->id, info->mime, info->size);
     return file_json(*info);
+  }
+
+  if (method == "files.edit") {
+    int64_t file_id = require_int(params, "file_id");
+    if (!db_.can_read_file(me, file_id)) throw ApiError(404, "FILE_NOT_FOUND");
+    auto info = db_.file_info(file_id);
+    if (!info || !info->ready) throw ApiError(404, "FILE_NOT_FOUND");
+    bool image = info->mime.rfind("image/", 0) == 0;
+    bool video = info->mime.rfind("video/", 0) == 0 || info->mime.rfind("audio/", 0) == 0;
+    if (!image && !video) throw ApiError(400, "NOT_MEDIA");
+    std::string src = file_path(file_id);
+    std::string dst = src + ".edit";
+    bool ok = false;
+    if (image) {
+      std::vector<std::string> args = {"convert", src};
+      if (auto w = optional_int(params, "crop_w")) {
+        int64_t h = optional_int(params, "crop_h").value_or(0);
+        int64_t x = optional_int(params, "crop_x").value_or(0);
+        int64_t y = optional_int(params, "crop_y").value_or(0);
+        if (*w < 1 || h < 1 || x < 0 || y < 0) throw ApiError(400, "BAD_CROP");
+        args.push_back("-crop");
+        args.push_back(std::to_string(*w) + "x" + std::to_string(h) + "+" + std::to_string(x) + "+" +
+                       std::to_string(y));
+      }
+      if (auto angle = optional_int(params, "rotate")) {
+        if (*angle != 0 && *angle != 90 && *angle != 180 && *angle != 270) throw ApiError(400, "BAD_ROTATE");
+        args.push_back("-rotate");
+        args.push_back(std::to_string(*angle));
+      }
+      if (params.find("brightness") || params.find("contrast")) {
+        int64_t b = optional_int(params, "brightness").value_or(0);
+        int64_t c = optional_int(params, "contrast").value_or(0);
+        if (b < -100 || b > 100 || c < -100 || c > 100) throw ApiError(400, "BAD_COLOR");
+        args.push_back("-brightness-contrast");
+        args.push_back(std::to_string(b) + "x" + std::to_string(c));
+      }
+      if (auto text = optional_string(params, "text")) {
+        check_plain(*text, 64, "BAD_TEXT", false);
+        if (text->find('@') != std::string::npos || text->find('%') != std::string::npos)
+          throw ApiError(400, "BAD_TEXT");
+        int64_t x = optional_int(params, "text_x").value_or(8);
+        int64_t y = optional_int(params, "text_y").value_or(24);
+        args.push_back("-fill");
+        args.push_back("white");
+        args.push_back("-pointsize");
+        args.push_back("24");
+        args.push_back("-annotate");
+        args.push_back("+" + std::to_string(x) + "+" + std::to_string(y));
+        args.push_back(*text);
+      }
+      if (auto w = optional_int(params, "spoiler_w")) {
+        int64_t h = optional_int(params, "spoiler_h").value_or(0);
+        int64_t x = optional_int(params, "spoiler_x").value_or(0);
+        int64_t y = optional_int(params, "spoiler_y").value_or(0);
+        if (*w < 1 || h < 1) throw ApiError(400, "BAD_SPOILER");
+        args.push_back("-region");
+        args.push_back(std::to_string(*w) + "x" + std::to_string(h) + "+" + std::to_string(x) + "+" +
+                       std::to_string(y));
+        args.push_back("-blur");
+        args.push_back("0x12");
+      }
+      args.push_back(dst);
+      ok = args.size() > 2 && run_argv(args);
+    } else {
+      std::vector<std::string> args = {"ffmpeg", "-y", "-i", src};
+      if (auto start = optional_int(params, "trim_start")) {
+        if (*start < 0) throw ApiError(400, "BAD_TRIM");
+        args.insert(args.begin() + 1, {"-ss", std::to_string(*start)});
+      }
+      if (auto end = optional_int(params, "trim_end")) {
+        if (*end < 1) throw ApiError(400, "BAD_TRIM");
+        args.push_back("-to");
+        args.push_back(std::to_string(*end));
+      }
+      args.push_back("-c");
+      args.push_back("copy");
+      args.push_back(dst);
+      ok = run_argv(args);
+    }
+    if (!ok) {
+      std::filesystem::remove(dst);
+      throw ApiError(400, "EDIT_FAILED");
+    }
+    std::error_code ec;
+    auto size = std::filesystem::file_size(dst, ec);
+    if (ec || size < 1) throw ApiError(400, "EDIT_FAILED");
+    FileInfo created = db_.create_file(me, info->name, info->mime, static_cast<int64_t>(size));
+    std::filesystem::rename(dst, file_path(created.id), ec);
+    if (ec) throw ApiError(500, "FILE_IO");
+    db_.file_received(created.id, static_cast<int64_t>(size), true);
+    created.ready = true;
+    created.received = created.size;
+    return file_json(created);
   }
 
   if (method == "files.read") {
@@ -934,12 +1103,25 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
     if (method == "calls.record") {
       bool recording = optional_bool(params, "recording").value_or(true);
       db_.set_call_recording(call_id, recording);
-      if (!recording) {
+      if (recording) {
+        std::filesystem::remove(call_record_path(call_id));
+      } else {
         int64_t saved = db_.saved_dialog(me);
         Outgoing draft;
         draft.kind = "file";
         draft.text = "запись эфира";
-        if (auto file_id = optional_int(params, "file_id")) {
+        std::string recorded = call_record_path(call_id);
+        std::error_code ec;
+        auto recorded_size = std::filesystem::file_size(recorded, ec);
+        if (!ec && recorded_size > 4) {
+          FileInfo stored = db_.create_file(me, "call-" + std::to_string(call_id) + ".ridm",
+                                            "application/x-rockid-call", static_cast<int64_t>(recorded_size));
+          std::filesystem::rename(recorded, file_path(stored.id), ec);
+          if (!ec) {
+            db_.file_received(stored.id, static_cast<int64_t>(recorded_size), true);
+            draft.file_id = stored.id;
+          }
+        } else if (auto file_id = optional_int(params, "file_id")) {
           if (!db_.can_read_file(me, *file_id)) throw ApiError(404, "FILE_NOT_FOUND");
           draft.file_id = *file_id;
         } else {
@@ -1031,6 +1213,7 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
       result.o["title"] = Json::str(app->title);
       result.o["short_name"] = Json::str(app->short_name);
       result.o["url"] = Json::str(app->url);
+      result.o["content"] = Json::str(app->content);
       return result;
     }
     Json arr = Json::array();
@@ -1077,7 +1260,11 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
       }
       if (amount < 1 || purpose.size() > 32) throw ApiError(400, "BAD_AMOUNT");
       if (!db_.user_by_id(user_id)) throw ApiError(404, "USER_NOT_FOUND");
-      return invoice_json(db_.create_invoice(me, user_id, title, amount, currency, purpose));
+      std::string pay_url = optional_string(params, "pay_url").value_or("");
+      if (!pay_url.empty() &&
+          (pay_url.size() > 512 || (pay_url.rfind("https://", 0) != 0 && pay_url.rfind("http://", 0) != 0)))
+        throw ApiError(400, "BAD_URL");
+      return invoice_json(db_.create_invoice(me, user_id, title, amount, currency, purpose, pay_url));
     }
     int64_t invoice_id = require_int(params, "invoice_id");
     std::string status = method == "payments.confirm" ? "paid" : "cancelled";
@@ -1090,8 +1277,143 @@ Json App::dispatch_extra(Connection &connection, const std::string &method, cons
     return invoice_json(*db_.invoice_by_id(invoice_id));
   }
 
+  if (method == "session.setOptions") {
+    bool compress = optional_bool(params, "compress").value_or(false);
+    connection.set_compress(compress);
+    Json result = Json::object();
+    result.o["compress"] = Json::boolean(compress);
+    return result;
+  }
+
+  if (method == "messages.ack") {
+    int64_t message_id = require_int(params, "message_id");
+    auto message = db_.message_by_id(message_id);
+    if (!message || message->deleted) throw ApiError(404, "MESSAGE_NOT_FOUND");
+    require_dialog(message->dialog_id);
+    note_delivered(message->dialog_id, message->id, me, message->sender_id);
+    Json result = Json::object();
+    result.o["message_id"] = Json::integer(message_id);
+    return result;
+  }
+
+  if (method == "keys.publish") {
+    std::string raw = b64_decode(require_string(params, "public_key"));
+    if (raw.size() != 32) throw ApiError(400, "BAD_KEY");
+    db_.publish_key(me, raw);
+    Json result = Json::object();
+    result.o["bytes"] = Json::integer(32);
+    return result;
+  }
+
+  if (method == "calls.media") {
+    int64_t call_id = require_int(params, "call_id");
+    std::string kind = require_string(params, "kind");
+    if (kind != "audio" && kind != "video" && kind != "screen") throw ApiError(400, "BAD_KIND");
+    std::string bytes = b64_decode(require_string(params, "data"));
+    if (bytes.empty() || bytes.size() > 256 * 1024) throw ApiError(400, "BAD_CHUNK");
+    auto call = db_.call_by_id(call_id);
+    if (!call || !call->active) throw ApiError(404, "CALL_NOT_FOUND");
+    require_dialog(call->dialog_id);
+    if (db_.call_recording(call_id)) append_call_media(call_id, kind, bytes);
+    Json data = Json::object();
+    data.o["call_id"] = Json::integer(call_id);
+    data.o["user_id"] = Json::integer(me);
+    data.o["kind"] = Json::str(kind);
+    data.o["data"] = Json::str(b64_encode(bytes));
+    Json update = Json::object();
+    update.o["update"] = Json::str("call.media");
+    update.o["data"] = std::move(data);
+    for (const CallPeer &peer : db_.call_peers(call_id)) {
+      if (peer.user_id != me) hub_.push_user(peer.user_id, update, nullptr);
+    }
+    Json result = Json::object();
+    result.o["bytes"] = Json::integer(static_cast<int64_t>(bytes.size()));
+    return result;
+  }
+
+  if (method == "apps.setContent") {
+    std::string short_name = require_string(params, "short_name");
+    std::string html = require_string(params, "html");
+    if (html.empty() || html.size() > 200 * 1024) throw ApiError(400, "BAD_HTML");
+    if (!db_.set_app_content(me, short_name, html)) throw ApiError(404, "APP_NOT_FOUND");
+    Json result = Json::object();
+    result.o["bytes"] = Json::integer(static_cast<int64_t>(html.size()));
+    return result;
+  }
+
   (void)kMaxGroup;
   throw ApiError(404, "UNKNOWN_METHOD");
+}
+
+namespace {
+
+std::string http_response(int code, const std::string &type, const std::string &body) {
+  std::string status = code == 200 ? "200 OK" : code == 404 ? "404 Not Found" : "400 Bad Request";
+  return "HTTP/1.1 " + status + "\r\nContent-Type: " + type +
+         "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+}
+
+std::string json_ok(const Json &result) {
+  Json resp = Json::object();
+  resp.o["ok"] = Json::boolean(true);
+  resp.o["result"] = result;
+  return http_response(200, "application/json; charset=utf-8", dump_json(resp));
+}
+
+}  // namespace
+
+std::string App::handle_http(const std::string &method, const std::string &path, const std::string &body) {
+  try {
+    if (path.rfind("/a/", 0) == 0 && method == "GET") {
+      auto app = db_.app_by_name(path.substr(3));
+      if (!app || app->content.empty()) return http_response(404, "text/plain", "not found");
+      return http_response(200, "text/html; charset=utf-8", app->content);
+    }
+    if (path.rfind("/bot", 0) == 0) {
+      auto slash = path.find('/', 4);
+      if (slash == std::string::npos) return http_response(404, "text/plain", "not found");
+      std::string token = path.substr(4, slash - 4);
+      std::string call = path.substr(slash + 1);
+      auto bot_id = db_.bot_by_token(token);
+      if (!bot_id) return http_response(404, "application/json", "{\"ok\":false,\"description\":\"unauthorized\"}");
+      auto bot = db_.user_by_id(*bot_id);
+      if (!bot) return http_response(404, "application/json", "{\"ok\":false}");
+      if (call == "getMe") return json_ok(user_json(*bot));
+      if (call == "getUpdates") {
+        Json arr = Json::array();
+        int n = 0;
+        for (const std::string &payload : db_.bot_updates(*bot_id, 50)) {
+          Json item = Json::object();
+          item.o["update_id"] = Json::integer(++n);
+          try {
+            item.o["message"] = parse_json(payload);
+          } catch (const JsonError &) {
+            item.o["message"] = Json::str(payload);
+          }
+          arr.a.push_back(std::move(item));
+        }
+        return json_ok(std::move(arr));
+      }
+      if (call == "sendMessage") {
+        Json params = body.empty() ? Json::object() : parse_json(body);
+        int64_t dialog_id = require_int(params, "chat_id");
+        std::string text = require_string(params, "text");
+        if (text.empty() || text.size() > 4096) throw ApiError(400, "BAD_TEXT");
+        auto access = db_.membership(dialog_id, *bot_id);
+        if (!access || !access->can_post) throw ApiError(403, "FORBIDDEN");
+        Outgoing draft;
+        draft.text = text;
+        Message message = db_.add_message(dialog_id, *bot_id, draft);
+        push_message(message, nullptr);
+        return json_ok(message_json(message));
+      }
+    }
+  } catch (const ApiError &ex) {
+    return http_response(400, "application/json", std::string("{\"ok\":false,\"description\":\"") + ex.what() + "\"}");
+  } catch (const std::exception &) {
+    return http_response(400, "application/json", "{\"ok\":false,\"description\":\"bad request\"}");
+  }
+  return http_response(404, "text/plain", "not found");
 }
 
 }

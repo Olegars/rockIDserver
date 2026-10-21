@@ -205,6 +205,7 @@ struct Invoice {
   std::string purpose;
   std::string status;
   std::string provider_ref;
+  std::string pay_url;
 };
 
 struct MiniApp {
@@ -213,6 +214,7 @@ struct MiniApp {
   std::string title;
   std::string short_name;
   std::string url;
+  std::string content;
 };
 
 struct SavedTab {
@@ -372,11 +374,23 @@ class Database {
   std::vector<MiniApp> list_apps();
 
   Invoice create_invoice(int64_t bot_id, int64_t user_id, const std::string &title, int64_t amount,
-                         const std::string &currency, const std::string &purpose);
+                         const std::string &currency, const std::string &purpose,
+                         const std::string &pay_url = {});
   std::optional<Invoice> invoice_by_id(int64_t id);
   std::vector<Invoice> list_invoices(int64_t user_id);
   bool set_invoice_status(int64_t id, int64_t bot_id, const std::string &status,
                           const std::string &provider_ref);
+
+  bool lock_instance();
+  void set_user_online(int64_t user_id, bool online);
+  void queue_push(int64_t user_id, const std::string &payload);
+  std::vector<std::string> take_pushes(int64_t user_id);
+  int64_t claim_device(const std::string &device_id, int64_t user_id, bool premium);
+  void publish_key(int64_t user_id, const std::string &public_key);
+  std::vector<std::pair<int64_t, std::string>> keys_for_dialog(int64_t dialog_id);
+  bool set_app_content(int64_t owner, const std::string &short_name, const std::string &html);
+  void update_file_meta(int64_t id, const std::string &mime, int64_t size);
+  bool call_recording(int64_t call_id);
 
  private:
   struct Tx {

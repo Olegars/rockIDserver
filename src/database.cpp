@@ -304,6 +304,27 @@ void Database::migrate() {
       "  user_id BIGINT NOT NULL REFERENCES users(id),"
       "  expires_at BIGINT NOT NULL"
       ")",
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS online BOOLEAN NOT NULL DEFAULT FALSE",
+      "UPDATE users SET online = FALSE",
+      "ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS content TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pay_url TEXT NOT NULL DEFAULT ''",
+      "CREATE TABLE IF NOT EXISTS offline_pushes ("
+      "  id BIGSERIAL PRIMARY KEY,"
+      "  user_id BIGINT NOT NULL REFERENCES users(id),"
+      "  payload TEXT NOT NULL,"
+      "  created_at BIGINT NOT NULL"
+      ")",
+      "CREATE INDEX IF NOT EXISTS idx_offline_user ON offline_pushes (user_id, id)",
+      "CREATE TABLE IF NOT EXISTS device_accounts ("
+      "  device_id TEXT NOT NULL,"
+      "  user_id BIGINT NOT NULL REFERENCES users(id),"
+      "  created_at BIGINT NOT NULL,"
+      "  PRIMARY KEY (device_id, user_id)"
+      ")",
+      "CREATE TABLE IF NOT EXISTS user_keys ("
+      "  user_id BIGINT PRIMARY KEY REFERENCES users(id),"
+      "  public_key BYTEA NOT NULL"
+      ")",
   };
   for (const char *sql : statements) exec(sql);
 }

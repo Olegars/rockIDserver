@@ -2,6 +2,7 @@
 
 #include "rockid/connection.hpp"
 #include "rockid/log.hpp"
+#include "seal.hpp"
 
 #include <ctime>
 #include <set>
@@ -130,8 +131,60 @@ void App::ensure_session(Connection &connection) {
   }
 }
 
+void App::claim_device(int64_t user_id, const Json &params) {
+  auto device_id = optional_string(params, "device_id");
+  if (!device_id || device_id->empty()) return;
+  if (device_id->size() > 64) throw ApiError(400, "BAD_DEVICE");
+  bool premium = db_.premium(user_id);
+  int64_t count = db_.claim_device(*device_id, user_id, premium);
+  if (count > (premium ? 4 : 3)) throw ApiError(400, "TOO_MANY_ACCOUNTS");
+}
+
+void App::note_delivered(int64_t dialog_id, int64_t message_id, int64_t user_id, int64_t sender_id) {
+  if (user_id == sender_id || sender_id == 0) return;
+  Json data = Json::object();
+  data.o["dialog_id"] = Json::integer(dialog_id);
+  data.o["message_id"] = Json::integer(message_id);
+  data.o["user_id"] = Json::integer(user_id);
+  Json update = Json::object();
+  update.o["update"] = Json::str("message.delivered");
+  update.o["data"] = std::move(data);
+  hub_.push_user(sender_id, update, nullptr);
+}
+
+void App::flush_offline(int64_t user_id) {
+  for (const std::string &payload : db_.take_pushes(user_id)) {
+    Json message;
+    try {
+      message = parse_json(payload);
+    } catch (const JsonError &) {
+      continue;
+    }
+    hub_.push_user(user_id, message, nullptr);
+    const Json *update = message.find("update");
+    const Json *data = message.find("data");
+    if (!update || !update->is_string() || update->s != "message.new" || !data || !data->is_object()) continue;
+    auto dialog_id = optional_int(*data, "dialog_id");
+    auto message_id = optional_int(*data, "id");
+    auto sender_id = optional_int(*data, "sender_id");
+    if (dialog_id && message_id && sender_id) note_delivered(*dialog_id, *message_id, user_id, *sender_id);
+  }
+}
+
+void App::remember_offline(int64_t user_id, const Json &message) {
+  const Json *update = message.find("update");
+  if (!update || !update->is_string()) return;
+  if (update->s == "presence" || update->s == "call.media") return;
+  try {
+    db_.queue_push(user_id, dump_json(message));
+  } catch (const std::exception &ex) {
+    log_error(std::string("offline: ") + ex.what());
+  }
+}
+
 void App::broadcast_presence(int64_t user_id, bool online) {
   try {
+    db_.set_user_online(user_id, online);
     if (!online) db_.touch_last_seen(user_id);
     Json data = Json::object();
     data.o["user_id"] = Json::integer(user_id);
@@ -140,6 +193,7 @@ void App::broadcast_presence(int64_t user_id, bool online) {
     update.o["update"] = Json::str("presence");
     update.o["data"] = std::move(data);
     hub_.push_many(db_.presence_recipients(user_id), update, nullptr);
+    if (online) flush_offline(user_id);
   } catch (const std::exception &ex) {
     log_error(std::string("presence: ") + ex.what());
   }
@@ -158,6 +212,9 @@ void App::push_message(const Message &message, Connection *except) {
     ids.swap(visible);
   }
   hub_.push_many(ids, update, except);
+  for (int64_t user_id : ids) {
+    if (hub_.online(user_id)) note_delivered(message.dialog_id, message.id, user_id, message.sender_id);
+  }
   try {
     db_.enqueue_bot_updates(message.dialog_id, message.sender_id, dump_json(update));
   } catch (const std::exception &ex) {
@@ -223,6 +280,7 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
     std::string device = optional_string(params, "device").value_or("");
     std::string platform = optional_string(params, "platform").value_or("");
     if (device.size() > 64 || platform.size() > 32) throw ApiError(400, "BAD_DEVICE");
+    claim_device(user->id, params);
     std::string token = db_.create_session(user->id, device, platform);
     connection.set_token(token);
     hub_.bind_user(&connection, user->id);
@@ -247,6 +305,7 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
     std::string device = optional_string(params, "device").value_or("");
     std::string platform = optional_string(params, "platform").value_or("");
     if (device.size() > 64 || platform.size() > 32) throw ApiError(400, "BAD_DEVICE");
+    claim_device(user->id, params);
     std::string token = db_.create_session(user->id, device, platform);
     connection.set_token(token);
     hub_.bind_user(&connection, user->id);
@@ -297,7 +356,8 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
     limits.o["pins"] = Json::integer(premium ? 10 : 5);
     limits.o["channel_subscriptions"] = Json::integer(premium ? 1000 : 500);
     limits.o["accounts"] = Json::integer(premium ? 4 : 3);
-    limits.o["download_chunk"] = Json::integer(premium ? 384 * 1024 : 64 * 1024);
+    limits.o["download_chunk"] = Json::integer(premium ? 700 * 1024 : 64 * 1024);
+    limits.o["upload_chunk"] = Json::integer(premium ? 700 * 1024 : 384 * 1024);
     result.o["limits"] = std::move(limits);
     return result;
   }
@@ -506,6 +566,8 @@ Json App::dispatch(Connection &connection, const std::string &method, const Json
       throw ApiError(400, "BAD_SCHEDULE");
     if (head->kind == "secret") {
       draft.no_forward = true;
+      std::string sealed = seal_dialog(draft.text, db_.keys_for_dialog(dialog_id));
+      if (!sealed.empty()) draft.text = std::move(sealed);
       if (head->ttl_seconds > 0 && draft.scheduled_at == 0)
         draft.expires_at = static_cast<int64_t>(std::time(nullptr)) + head->ttl_seconds;
     }
